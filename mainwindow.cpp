@@ -8,6 +8,7 @@
 #include <QNetworkProxy>
 #include <QDebug>
 
+
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
     , ui(new Ui::MainWindow)
@@ -108,6 +109,11 @@ void MainWindow::on_btnSend_clicked()
 
 // 点击“下载”按钮
 void MainWindow::on_btnDownload_clicked() {
+    // 每次点击下载前，重置接收状态计数器，防止上一次的数据干扰
+    isHeaderReceived = false;
+    totalBytesReceived = 0;
+    targetFileSize = 0;
+
     // 1. 准备连接参数（确保 IP 和端口与虚拟机一致）
     QString ip = "192.168.172.128";
     quint16 port = 9999;
@@ -121,7 +127,7 @@ void MainWindow::on_btnDownload_clicked() {
         // 等待 3 秒尝试连接
         if (!tcpSocket->waitForConnected(3000)) {
             ui->textEdit->append("连接失败！原因: " + tcpSocket->errorString());
-            return; // 连接失败就退出，不再执行后面的 write
+            return;
         }
     }
 
@@ -130,24 +136,67 @@ void MainWindow::on_btnDownload_clicked() {
     ui->textEdit->append("已向服务器请求下载源码 (GET)...");
 }
 
-// 核心：处理 Linux 传回来的数据流
+// ================== 【位置 2：完全重写替换后的 onReadyRead 函数】 ==================
 void MainWindow::onReadyRead() {
-    // 读取目前缓冲区的所有数据
-    QByteArray data = tcpSocket->readAll();
+    // 状态 A：如果还没有收到文件头，优先解析文件头
+    if (!isHeaderReceived) {
+        // 如果缓冲区的数据大小，连一个 FileHeader 结构体的大小(264字节)都不够，就退出继续等
+        if (tcpSocket->bytesAvailable() < sizeof(FileHeader)) {
+            return;
+        }
 
-    // 如果数据长度很小且内容是"GET"，说明是指令，不保存（可选逻辑）
-    // 但通常这里收到的直接就是文件流
+        // 数据够了，把文件头结构体整体读出来
+        FileHeader header;
+        tcpSocket->read((char*)&header, sizeof(FileHeader));
 
-    // 保存到桌面，起个好区分的名字
-    QString savePath = "C:/Users/vgy69/Desktop/from_linux_server.c";
-    QFile file(savePath);
+        // 从结构体里提取出虚拟机传过来的真实文件名和文件总大小
+        currentFileName = QString::fromUtf8(header.filename);
+        targetFileSize = header.filesize;
+        isHeaderReceived = true; // 状态切换：表示文件头已成功解析出来了
+        totalBytesReceived = 0;  // 重置接收计数器
 
-    // 使用 Append 追加模式，确保大文件分次接收时能完整拼合
-    if (file.open(QIODevice::Append)) {
-        file.write(data);
-        file.close();
-        ui->textEdit->append(QString("收到数据块: %1 字节，已存至桌面").arg(data.size()));
-    } else {
-        ui->textEdit->append("错误：无法在桌面创建文件，请检查权限！");
+        ui->textEdit->append(QString("【协议解析】即将下载文件: %1, 总大小: %2 字节").arg(currentFileName).arg(targetFileSize));
+
+        // 自动初始化你在界面上拖出来的 progressBar 进度条
+        ui->progressBar->setRange(0, 100);
+        ui->progressBar->setValue(0);
+
+        // 如果服务端刚发完头，缓冲区里还有后续的数据块，不要跳出，直接往下走去读数据
+        if (tcpSocket->bytesAvailable() == 0) {
+            return;
+        }
+    }
+
+    // 状态 B：文件头已经解析过，后面来的全是 1024 字节的文件分块流
+    if (tcpSocket->bytesAvailable() > 0) {
+        QByteArray data = tcpSocket->readAll();
+
+        // 依然保存到桌面，但是文件名直接使用从 Linux 传过来的真实名字 currentFileName
+        QString savePath = QString("C:/Users/vgy69/Desktop/%1").arg(currentFileName);
+        QFile file(savePath);
+
+        if (file.open(QIODevice::WriteOnly | QIODevice::Append)) { // 用追加模式安全写入
+            file.write(data);
+            file.close();
+
+            totalBytesReceived += data.size(); // 累加收到的字节数
+
+            // 计算当前百分比，并实时刷新你的 UI 进度条
+            int progress = static_cast<int>((totalBytesReceived * 100) / targetFileSize);
+            ui->progressBar->setValue(progress);
+
+            ui->textEdit->append(QString("已分块接收: %1/%2 字节 (%3%)")
+                                     .arg(totalBytesReceived).arg(targetFileSize).arg(progress));
+
+            // 如果收到的总字节数达到了目标文件的大小，说明整个大文件下载完毕
+            if (totalBytesReceived >= targetFileSize) {
+                ui->textEdit->append("★ 恭喜：大文件分块下载并组装完毕！");
+                isHeaderReceived = false; // 功成身退，重置状态为下一次下载做准备
+                tcpSocket->disconnectFromHost(); // 优雅断开连接
+            }
+        } else {
+            ui->textEdit->append("错误：无法在桌面创建文件，请检查权限！");
+        }
     }
 }
+// ============================================================================
