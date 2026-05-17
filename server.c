@@ -4,6 +4,12 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 
+// 任务二新增：定义文件头结构体，用于传输元数据
+typedef struct {
+    char filename[256];
+    long filesize;
+} FileHeader;
+
 int main() {
     // 1. 创建套接字
     int lfd = socket(AF_INET, SOCK_STREAM, 0);
@@ -34,20 +40,50 @@ int main() {
         if (len > 0) {
             buf[len] = '\0';
             
-            // --- 情况 A：收到下载请求 ---
-            if (strncmp(buf, "GET", 3) == 0) {
-                printf("收到下载请求，正在回传 server.c...\n");
-                FILE *fp = fopen("server.c", "rb"); // 确保目录下有这个文件
-                if (fp == NULL) {
-                    printf("错误：找不到 server.c 文件\n");
-                } else {
-                    while ((len = fread(buf, 1, sizeof(buf), fp)) > 0) {
-                        send(cfd, buf, len, 0);
-                    }
-                    fclose(fp);
-                    printf("文件回传完毕！\n");
-                }
-            } 
+            /// --- 情况 A：收到下载请求 ---
+if (strncmp(buf, "GET", 3) == 0) {
+    printf("收到下载请求，正在回传 server.c...\n");
+    FILE *fp = fopen("server.c", "rb"); 
+    if (fp == NULL) {
+        printf("错误：找不到 server.c 文件\n");
+    } else {
+        // =================【新插入：计算大小并发送协议头】=================
+        // 1. 计算文件大小
+        fseek(fp, 0, SEEK_END);
+        long file_size = ftell(fp);
+        fseek(fp, 0, SEEK_SET);
+
+        // 2. 填充结构体面单
+        FileHeader header;
+        strcpy(header.filename, "server_downloaded.c"); // 传到 Windows 后的文件名
+        header.filesize = file_size;
+
+        // 3. 率先把这块结构体数据发给 Windows
+        send(cfd, &header, sizeof(header), 0);
+        
+        // 4. 稍微延迟 0.1 秒（100毫秒），防止后面的大文件数据跟面单粘在同一个网络包里
+        usleep(100000); 
+        // ====================================================================
+
+
+        // =================【新修改：确保用 1024 固定大小循环分块】=================
+        long total_sent = 0;
+        // 强制每次只读 1024 字节，实现加分项中的“分块传输”
+        while ((len = fread(buf, 1, 1024, fp)) > 0) {
+            int sent = send(cfd, buf, len, 0);
+            if (sent < 0) {
+                perror("发送中断");
+                break;
+            }
+            total_sent += sent;
+            printf("已分块回传: %ld/%ld 字节\n", total_sent, file_size);
+        }
+        // ====================================================================
+
+        fclose(fp);
+        printf("文件分块回传完毕，共发送 %ld 字节！\n", total_sent);
+    }
+}
             // --- 情况 B：收到上传请求 ---
             else {
                 printf("收到上传信息: %s，开始接收文件...\n", buf);
